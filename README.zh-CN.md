@@ -121,7 +121,7 @@ bash docker_restore.sh --projects NginxProxyManager,openlist,komari --yes
 使用配置文件运行：
 
 ```bash
-cp config.example.env .env
+cp .env.example .env
 bash docker_restore.sh --config .env --yes
 ```
 
@@ -129,7 +129,7 @@ bash docker_restore.sh --config .env --yes
 
 ## 配置文件
 
-示例配置见：[`config.example.env`](./config.example.env)
+示例配置见：[`.env.example`](./.env.example)
 
 ```bash
 REMOTE_NAME=infini
@@ -211,7 +211,7 @@ TELEGRAM_CHAT_ID=
 ├── LICENSE
 ├── README.md
 ├── README.zh-CN.md
-├── config.example.env
+├── .env.example
 └── docker_restore.sh
 ```
 

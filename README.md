@@ -1,68 +1,39 @@
 # docker-restore-tool
 
-A Bash-first restore utility for recovering Docker project backups from an `rclone` remote onto a fresh server.
+> Restore Docker project backups from an `rclone` remote to a fresh server with a Bash-first workflow.
 
-It is designed for the very practical ops workflow of:
+`docker-restore-tool` is a lightweight restore utility for operators who keep compressed project backups in remote storage and want a repeatable way to recover them onto a new host.
 
-1. storing compressed backups remotely,
-2. pulling the selected archive to a temporary workspace,
-3. extracting it safely into a staging directory,
-4. copying the restored project tree into a target root such as `/opt`,
-5. verifying that expected project directories exist.
+It focuses on a pragmatic flow:
+
+- list available backup archives,
+- select the newest archive or specify one manually,
+- download it via `rclone`,
+- extract it into a staging directory,
+- copy restored files into a target root such as `/opt`,
+- verify that expected project directories exist.
+
+---
 
 ## Features
 
-- Works with any `rclone` remote
+- Supports any `rclone` remote
 - Lists available backup archives from a remote directory
-- Auto-selects the latest backup when no file is specified
-- Supports explicit backup file selection
-- Extracts into a staging directory before copying into the final restore root
-- Verifies restored projects using a configurable project list
-- Optional Telegram notifications
+- Auto-selects the latest archive if no filename is provided
+- Supports explicit backup selection
+- Extracts into a staging directory before copying into the final destination
+- Verifies restored project directories using a configurable project list
 - Supports non-interactive execution with `--yes`
-- Supports dry runs with `--dry-run`
-- Supports runtime overrides for remote, directory, restore root, temp dir, log file, and project list
-- Supports loading env-style config from a file
+- Supports safe previews with `--dry-run`
+- Supports env-style config files
+- Optional Telegram notifications
+- Small, auditable Bash codebase
 
-## Why this exists
+---
 
-A lot of “restore scripts” are really just one-off shell fragments glued together during an incident. This project turns that pattern into a small reusable tool that is:
+## Quick Start
 
-- easier to review,
-- easier to rerun,
-- safer to publish,
-- easier to adapt for another host or another backup location.
-
-## Requirements
-
-Required tools:
-
-- `bash`
-- `rclone`
-- `tar`
-- `awk`
-- `grep`
-- `sed`
-- `cut`
-- `du`
-
-Optional but recommended:
-
-- `pigz` — faster decompression
-- `column` — nicer backup list formatting
-- `curl` — required only for Telegram notification delivery
-
-## Installation
-
-Clone the repository:
-
-```bash
-git clone <your-repo-url>
-cd docker-restore-tool
-chmod +x docker_restore.sh
-```
-
-Install dependencies on Debian/Ubuntu:
+### 1. Install dependencies
 
 ```bash
 sudo apt-get update
@@ -70,38 +41,32 @@ sudo apt-get install -y tar pigz bsdextrautils curl
 curl https://rclone.org/install.sh | sudo bash
 ```
 
-## Quick start
-
-### 1. Configure rclone
+### 2. Configure `rclone`
 
 ```bash
 rclone config
 rclone listremotes
 ```
 
-### 2. Test remote access
+### 3. Test remote access
 
 ```bash
 rclone ls infini:Backup/RN/Docker
 ```
 
-### 3. Run a dry run first
+### 4. Run a dry run first
 
 ```bash
 bash docker_restore.sh --dry-run
 ```
 
-### 4. Run an actual restore
+### 5. Run a real restore
 
 ```bash
 bash docker_restore.sh --yes
 ```
 
-Or specify an exact backup file:
-
-```bash
-bash docker_restore.sh DockerBackup_2026-04-05_160000.tar.gz --yes
-```
+---
 
 ## Usage
 
@@ -125,37 +90,11 @@ bash docker_restore.sh [backup-file] [options]
 | `--no-telegram` | Disable Telegram notifications |
 | `-h, --help` | Show help |
 
-## Configuration
+---
 
-You can either pass flags directly or load settings from a file.
+## Example Commands
 
-Example config file: [`config.example.env`](./config.example.env)
-
-```bash
-cp config.example.env .env
-```
-
-Then edit it and run:
-
-```bash
-bash docker_restore.sh --config .env --yes
-```
-
-### Supported config variables
-
-```bash
-REMOTE_NAME=infini
-REMOTE_DIR=Backup/RN/Docker
-RESTORE_ROOT=/opt
-TEMP_DIR=/tmp/docker_restore_work
-LOG_FILE=/tmp/docker_restore.log
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-```
-
-## Examples
-
-Restore latest archive from the default remote:
+Restore the newest archive from the default remote:
 
 ```bash
 bash docker_restore.sh --yes
@@ -167,7 +106,7 @@ Restore a specific archive:
 bash docker_restore.sh DockerBackup_2026-04-05_160000.tar.gz --yes
 ```
 
-Use a custom remote and target directory:
+Use a custom remote and destination:
 
 ```bash
 bash docker_restore.sh \
@@ -183,92 +122,114 @@ Verify only selected projects:
 bash docker_restore.sh --projects NginxProxyManager,openlist,komari --yes
 ```
 
-Preview everything without changing the filesystem:
+Run with an env-style config file:
 
 ```bash
-bash docker_restore.sh --dry-run
+cp config.example.env .env
+bash docker_restore.sh --config .env --yes
 ```
 
-Disable notifications even if env vars are present:
+---
+
+## Configuration
+
+Example config file: [`config.example.env`](./config.example.env)
 
 ```bash
-bash docker_restore.sh --yes --no-telegram
+REMOTE_NAME=infini
+REMOTE_DIR=Backup/RN/Docker
+RESTORE_ROOT=/opt
+TEMP_DIR=/tmp/docker_restore_work
+LOG_FILE=/tmp/docker_restore.log
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
-## How it works
+---
+
+## How It Works
 
 1. Validate required tools
 2. Validate that the `rclone` remote exists
-3. List available backup files in the remote directory
-4. Choose the latest archive or use the requested filename
+3. List available backup archives in the remote directory
+4. Select the latest archive or use the provided filename
 5. Download the archive into a temp directory
 6. Preview archive contents
-7. Extract into a staging directory under the temp directory
+7. Extract into a staging directory
 8. Copy the staged restore root into the final destination
 9. Verify expected project directories
-10. Print follow-up operational steps
+10. Print suggested post-restore actions
 
-## Safety notes
+---
 
-This tool is intentionally powerful. That means it can also be dangerous.
+## Safety Notes
 
-### What to watch out for
+This tool is intentionally powerful. Read this before using it on production hosts.
 
-- It restores real files into a destination such as `/opt`
+### Risks
+
+- It restores real files into a target directory such as `/opt`
 - Existing files may be overwritten
-- It assumes the archive structure matches your chosen `--restore-root`
+- It assumes the archive layout matches your chosen `--restore-root`
 - Telegram notifications send execution results to an external service
-- The script trusts the operator’s `rclone` configuration and remote contents
+- It trusts the operator’s `rclone` configuration and remote contents
 
-### Recommended practice
+### Recommended Practice
 
-- Test with `--dry-run` first
-- Use a disposable VM before production use
+- Always run `--dry-run` first
+- Test on a disposable VM before production use
 - Snapshot the host before a real restore
 - Review the archive layout with `tar -tzf`
-- Do not commit live tokens, chat IDs, remote credentials, or internal hostnames
+- Never commit live tokens, chat IDs, remote credentials, or private infrastructure details
+
+---
 
 ## Limitations
 
-- The verification step only checks whether expected directories exist
-- It does not validate application health after container startup
-- It does not currently verify checksums or signatures
-- It assumes tar.gz archives
-- It is designed for directory restores, not database-aware logical restores
+- Verification only checks whether expected directories exist
+- It does not validate application health after containers start
+- It does not verify checksums or signatures yet
+- It currently assumes `tar.gz` archives
+- It is aimed at directory-based restores, not logical database restores
+
+---
 
 ## Roadmap
 
 Potential next improvements:
 
-- checksum validation (`sha256`)
+- SHA256 checksum validation
 - archive manifest support
 - project auto-discovery instead of a static project list
-- rollback/backup of existing destination directories before overwrite
+- automatic backup of destination directories before overwrite
 - structured logging
-- health-check hooks after restore
-- optional rsync-based copy stage
-- CI checks (`shellcheck`, `shfmt`)
+- post-restore health checks
+- optional `rsync`-based copy stage
+- CI checks with `shellcheck` and `shfmt`
 
-## Publishing checklist
+---
 
-Before pushing this repository to GitHub, confirm that:
-
-- [x] no real Telegram token is hardcoded
-- [x] no real Telegram chat ID is hardcoded
-- [x] no private remote credentials are stored in the repo
-- [x] no internal hostnames or private IPs are embedded
-- [x] README documents the restore risks clearly
-
-## Project structure
+## Project Structure
 
 ```text
 .
 ├── .gitignore
 ├── LICENSE
 ├── README.md
+├── README.zh-CN.md
 ├── config.example.env
 └── docker_restore.sh
 ```
+
+---
+
+## Chinese Documentation
+
+For a Chinese version of this README, see:
+
+- [README.zh-CN.md](./README.zh-CN.md)
+
+---
 
 ## License
 

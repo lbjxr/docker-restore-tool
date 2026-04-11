@@ -36,6 +36,8 @@ It is built for a practical flow:
 - [Configuration](#configuration)
 - [Example Commands](#example-commands)
 - [How It Works](#how-it-works)
+- [Restore Flow](#restore-flow)
+- [Troubleshooting](#troubleshooting)
 - [Safety Notes](#safety-notes)
 - [Limitations](#limitations)
 - [Roadmap](#roadmap)
@@ -159,6 +161,29 @@ rclone ls infini:Backup/RN/Docker
 ```
 
 If `rclone ls` works, the script should be able to read the backup list too.
+
+### Example: InfiniCloud via WebDAV
+
+If your backup storage is InfiniCloud WebDAV, a typical `rclone config` flow looks like this:
+
+```text
+n) New remote
+name> infini
+Storage> webdav
+url> https://infini-cloud.net/dav
+vendor> other
+user> <your-username>
+password> <your-password>
+bearer_token> 
+y) Yes this is OK
+q) Quit config
+```
+
+After that, test it again:
+
+```bash
+rclone ls infini:Backup/RN/Docker
+```
 
 ---
 
@@ -306,6 +331,99 @@ bash docker_restore.sh --config .env --yes --no-telegram
 8. Copy the staged restore root into the final destination
 9. Verify expected project directories
 10. Print suggested post-restore actions
+
+---
+
+## Restore Flow
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Check dependencies]
+    B --> C[Check rclone remote]
+    C --> D[List remote backups]
+    D --> E[Select latest or specified archive]
+    E --> F[Download archive to temp dir]
+    F --> G[Preview archive contents]
+    G --> H[Confirm restore or use --yes]
+    H --> I[Extract to staging directory]
+    I --> J[Copy restored files to target root]
+    J --> K[Verify expected project directories]
+    K --> L[Print next steps / optional Telegram notice]
+```
+
+---
+
+## Troubleshooting
+
+### `rclone remote not found`
+
+Cause:
+- The remote name in `.env` or `--remote` does not exist on the machine.
+
+Check:
+
+```bash
+rclone listremotes
+```
+
+Fix:
+- Create the remote with `rclone config`
+- Or update `REMOTE_NAME` / `--remote` to the correct value
+
+### `No backup files found`
+
+Cause:
+- The remote directory is wrong
+- The archive naming pattern does not match
+- The remote is reachable, but the directory is empty
+
+Check:
+
+```bash
+rclone ls infini:Backup/RN/Docker
+```
+
+Fix:
+- Verify `REMOTE_DIR`
+- Confirm your backups are stored under the expected path
+- Confirm archive names still contain `DockerBackup_`
+
+### `Expected extracted directory not found`
+
+Cause:
+- The archive layout does not match `--restore-root`
+
+Example:
+- If `--restore-root /opt` is used, the archive is expected to contain paths under `opt/...`
+
+Check:
+
+```bash
+tar -tzf your-backup.tar.gz | head -50
+```
+
+Fix:
+- Adjust `--restore-root`
+- Or rebuild the archive with the expected directory structure
+
+### Restore completed but some projects show `not found`
+
+Cause:
+- The verification list does not match the actual project names
+- The backup does not contain all expected projects
+
+Fix:
+- Pass a custom list with `--projects`
+- Or edit the config / defaults to match your actual restore set
+
+### Permission denied when restoring into `/opt`
+
+Cause:
+- The current user cannot write to the target directory
+
+Fix:
+- Run with a user that has permission
+- Or restore into another writable directory first
 
 ---
 

@@ -41,6 +41,8 @@
 - [配置文件](#配置文件)
 - [示例命令](#示例命令)
 - [工作流程](#工作流程)
+- [恢复流程图](#恢复流程图)
+- [常见问题排查](#常见问题排查)
 - [安全提醒](#安全提醒)
 - [当前限制](#当前限制)
 - [后续路线图](#后续路线图)
@@ -163,6 +165,29 @@ rclone ls infini:Backup/RN/Docker
 ```
 
 只要 `rclone ls` 能成功，脚本通常就能正常读取备份列表。
+
+### InfiniCloud WebDAV 示例
+
+如果你用的是 InfiniCloud WebDAV，`rclone config` 的典型流程大致如下：
+
+```text
+n) New remote
+name> infini
+Storage> webdav
+url> https://infini-cloud.net/dav
+vendor> other
+user> <你的用户名>
+password> <你的密码>
+bearer_token> 
+y) Yes this is OK
+q) Quit config
+```
+
+然后再次验证：
+
+```bash
+rclone ls infini:Backup/RN/Docker
+```
 
 ---
 
@@ -310,6 +335,99 @@ bash docker_restore.sh --config .env --yes --no-telegram
 8. 将 staging 中对应路径复制到最终目录
 9. 校验目标项目目录是否存在
 10. 输出恢复后的后续动作建议
+
+---
+
+## 恢复流程图
+
+```mermaid
+flowchart TD
+    A[开始] --> B[检查依赖]
+    B --> C[检查 rclone remote]
+    C --> D[列出远程备份]
+    D --> E[选择最新或指定归档]
+    E --> F[下载到临时目录]
+    F --> G[预览归档内容]
+    G --> H[确认恢复 或 使用 --yes]
+    H --> I[解压到 staging 目录]
+    I --> J[复制到目标恢复目录]
+    J --> K[校验项目目录]
+    K --> L[输出后续步骤 / 可选 Telegram 通知]
+```
+
+---
+
+## 常见问题排查
+
+### `rclone remote not found`
+
+原因：
+- `.env` 或 `--remote` 里的 remote 名称在当前机器上不存在
+
+检查：
+
+```bash
+rclone listremotes
+```
+
+修复：
+- 用 `rclone config` 创建 remote
+- 或修正 `REMOTE_NAME` / `--remote`
+
+### `No backup files found`
+
+原因：
+- 远程目录写错了
+- 归档命名规则不匹配
+- remote 能访问，但目录为空
+
+检查：
+
+```bash
+rclone ls infini:Backup/RN/Docker
+```
+
+修复：
+- 检查 `REMOTE_DIR`
+- 确认备份确实在目标路径下
+- 确认归档名称仍包含 `DockerBackup_`
+
+### `Expected extracted directory not found`
+
+原因：
+- 归档内部结构和 `--restore-root` 不匹配
+
+例如：
+- 如果使用 `--restore-root /opt`，那么归档里应包含 `opt/...` 这样的路径
+
+检查：
+
+```bash
+tar -tzf your-backup.tar.gz | head -50
+```
+
+修复：
+- 调整 `--restore-root`
+- 或重新打包归档，使目录结构符合预期
+
+### 恢复完成但部分项目显示 `not found`
+
+原因：
+- 校验用的项目列表和实际项目名不一致
+- 备份本身不包含全部预期项目
+
+修复：
+- 用 `--projects` 传入自定义项目列表
+- 或调整默认项目列表/配置
+
+### 恢复到 `/opt` 时出现 Permission denied
+
+原因：
+- 当前用户没有写入目标目录的权限
+
+修复：
+- 用有权限的用户执行
+- 或先恢复到其他可写目录再处理
 
 ---
 

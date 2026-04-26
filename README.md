@@ -9,9 +9,10 @@ It is built for a practical flow:
 - list available backup archives,
 - pick the newest archive or specify one manually,
 - download it via `rclone`,
+- safely preview archive contents,
 - extract into a staging directory,
 - copy restored files into a target root such as `/opt`,
-- verify that expected project directories exist.
+- verify restored projects and whether they are immediately startable.
 
 ---
 
@@ -21,7 +22,9 @@ It is built for a practical flow:
 - **Dry-run support** before touching the filesystem
 - **Non-interactive mode** with `--yes`
 - **Config file support** via `.env.example`
-- **Optional Telegram notifications**
+- **Optional Telegram notifications with richer summaries**
+- **Optional `--start-services` to run `docker compose up -d` automatically**
+- **Auto-detects top-level projects under `RESTORE_ROOT/*` from the archive by default**
 - **Small Bash codebase** that's easy to review and modify
 
 ---
@@ -74,12 +77,14 @@ Typical examples:
 - `sed`
 - `cut`
 - `du`
+- `cp`
 
 ### Optional but recommended
 
 - `pigz` — faster decompression
 - `column` — prettier backup list output
 - `curl` — needed only for Telegram notifications
+- `docker` / `docker compose` — needed only when `--start-services` is used
 
 ### Install dependencies on Debian / Ubuntu
 
@@ -132,6 +137,12 @@ bash docker_restore.sh --config .env --dry-run
 
 ```bash
 bash docker_restore.sh --config .env --yes
+```
+
+### 6) Auto-start restored compose projects if desired
+
+```bash
+bash docker_restore.sh --config .env --yes --start-services
 ```
 
 ---
@@ -211,6 +222,12 @@ bash docker_restore.sh --config .env --yes
 
 ```bash
 bash docker_restore.sh DockerBackup_2026-04-05_160000.tar.gz --config .env --yes
+```
+
+### Auto-start restored projects that include compose files
+
+```bash
+bash docker_restore.sh --config .env --yes --start-services
 ```
 
 ### Preview without changing anything
@@ -293,6 +310,14 @@ bash docker_restore.sh --config .env --restore-root /srv/apps --yes
 bash docker_restore.sh --config .env --projects NginxProxyManager,openlist,komari --yes
 ```
 
+> If `--projects` is omitted, the script auto-detects top-level directories under `RESTORE_ROOT` from the archive instead of relying on a hard-coded list.
+
+### Auto-start restored compose projects
+
+```bash
+bash docker_restore.sh --config .env --yes --start-services
+```
+
 ### Disable Telegram notifications
 
 ```bash
@@ -307,11 +332,12 @@ bash docker_restore.sh --config .env --yes --no-telegram
 |---|---|
 | `-c, --config <file>` | Load environment variables from a config file |
 | `--remote <name>` | rclone remote name |
-| `--remote-dir <path>` | rclone remote directory |
+| `--remote-dir <path>` | rclone remote directory; normalized to avoid duplicate slashes |
 | `--restore-root <path>` | final destination root |
 | `--temp-dir <path>` | temporary working directory |
 | `--log-file <path>` | log file path |
-| `--projects <csv>` | comma-separated project names used in verification |
+| `--projects <csv>` | comma-separated project names for verification; auto-detected from the archive if omitted |
+| `--start-services` | run `docker compose up -d` for restored projects that contain compose files |
 | `-y, --yes` | skip interactive confirmation |
 | `--dry-run` | preview actions without modifying files |
 | `--no-telegram` | disable Telegram notifications |
@@ -323,14 +349,17 @@ bash docker_restore.sh --config .env --yes --no-telegram
 
 1. Validate required tools
 2. Validate that the `rclone` remote exists
-3. List available backup archives in the remote directory
-4. Select the latest archive or use the provided filename
-5. Download the archive into a temporary directory
-6. Preview archive contents
-7. Extract into a staging directory
-8. Copy the staged restore root into the final destination
-9. Verify expected project directories
-10. Print suggested post-restore actions
+3. Normalize `REMOTE_DIR` to avoid duplicated slashes in paths and logs
+4. List available backup archives in the remote directory
+5. Select the latest archive or use the provided filename
+6. Download the archive into a temporary directory
+7. Safely preview archive contents without consuming the restore stream
+8. Auto-detect top-level project directories under `RESTORE_ROOT` unless `--projects` is provided
+9. Extract into a staging directory
+10. Copy the staged restore root into the final destination
+11. Classify verification results into three groups: restored and startable, restored without compose, and missing
+12. Optionally start restored compose projects with `docker compose up -d`
+13. Optionally send a Telegram summary with backup name, restore root, project summary, startable count, result type, and exit code
 
 ---
 
@@ -340,15 +369,17 @@ bash docker_restore.sh --config .env --yes --no-telegram
 flowchart TD
     A[Start] --> B[Check dependencies]
     B --> C[Check rclone remote]
-    C --> D[List remote backups]
-    D --> E[Select latest or specified archive]
-    E --> F[Download archive to temp dir]
-    F --> G[Preview archive contents]
-    G --> H[Confirm restore or use --yes]
-    H --> I[Extract to staging directory]
-    I --> J[Copy restored files to target root]
-    J --> K[Verify expected project directories]
-    K --> L[Print next steps / optional Telegram notice]
+    C --> D[Normalize remote directory]
+    D --> E[List remote backups]
+    E --> F[Select latest or specified archive]
+    F --> G[Download archive to temp dir]
+    G --> H[Safely preview archive contents]
+    H --> I[Auto-detect projects or use --projects]
+    I --> J[Confirm restore or use --yes]
+    J --> K[Extract to staging directory]
+    K --> L[Copy restored files to target root]
+    L --> M[Classify project restore status]
+    M --> N[Optional compose start / Telegram notice]
 ```
 
 ---
@@ -409,12 +440,25 @@ Fix:
 ### Restore completed but some projects show `not found`
 
 Cause:
-- The verification list does not match the actual project names
+- The projects provided via `--projects` do not match the actual restore contents
+- Auto-detected projects do not exist under the final restore directory
 - The backup does not contain all expected projects
 
 Fix:
-- Pass a custom list with `--projects`
-- Or edit the config / defaults to match your actual restore set
+- Pass an explicit list with `--projects`
+- Inspect the archive contents under `opt/` or your custom restore root
+- Confirm `--restore-root` matches the archive layout
+
+### Restored but not startable
+
+Cause:
+- The project directory exists but does not contain `docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, or `compose.yaml`
+- The compose file is stored under a different name or location
+
+Fix:
+- Inspect the project directory manually
+- Rename or move the compose file if needed
+- Ignore the state if the project is not meant to be started via compose
 
 ### Permission denied when restoring into `/opt`
 
@@ -436,6 +480,7 @@ This tool is intentionally powerful. Read this before using it on production hos
 - It restores real files into a target directory such as `/opt`
 - Existing files may be overwritten
 - It assumes the archive layout matches your chosen `--restore-root`
+- `--start-services` may immediately start restored compose projects
 - Telegram notifications send execution results to an external service
 - It trusts the operator’s `rclone` configuration and remote contents
 
@@ -451,8 +496,8 @@ This tool is intentionally powerful. Read this before using it on production hos
 
 ## Limitations
 
-- Verification only checks whether expected directories exist
-- It does not validate application health after containers start
+- Verification classifies directory presence and compose-file presence only
+- Even with `--start-services`, it does not validate application health after startup
 - It does not verify checksums or signatures yet
 - It currently assumes `tar.gz` archives
 - It is aimed at directory-based restores, not logical database restores
@@ -465,10 +510,9 @@ Potential next improvements:
 
 - SHA256 checksum validation
 - archive manifest support
-- project auto-discovery instead of a static project list
 - automatic backup of destination directories before overwrite
 - structured logging
-- post-restore health checks
+- post-start health checks
 - optional `rsync`-based copy stage
 - CI checks with `shellcheck` and `shfmt`
 

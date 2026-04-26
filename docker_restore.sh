@@ -7,15 +7,6 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-DEFAULT_PROJECTS=(
-  "NginxProxyManager"
-  "HexoXR"
-  "Qexo"
-  "sunpanel"
-  "openlist"
-  "komari"
-)
-
 REMOTE_NAME="${REMOTE_NAME:-infini}"
 REMOTE_DIR="${REMOTE_DIR:-Backup/RN/Docker}"
 RESTORE_ROOT="${RESTORE_ROOT:-/opt}"
@@ -23,13 +14,28 @@ TEMP_DIR="${TEMP_DIR:-/tmp/docker_restore_work}"
 LOG_FILE="${LOG_FILE:-/tmp/docker_restore.log}"
 CONFIG_FILE="${CONFIG_FILE:-}"
 BACKUP_FILE=""
+DOWNLOADED_BACKUP=""
 YES_MODE=false
 DRY_RUN=false
 NO_TELEGRAM=false
-PROJECTS=("${DEFAULT_PROJECTS[@]}")
+START_SERVICES=false
+PROJECTS=()
+PROJECTS_SOURCE="auto-detected from archive"
+SELECTED_PROJECTS_CSV=""
 
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
+RESTORED_STARTABLE=()
+RESTORED_NO_COMPOSE=()
+MISSING_PROJECTS=()
+STARTED_PROJECTS=()
+STARTABLE_COUNT=0
+RESTORED_NO_COMPOSE_COUNT=0
+MISSING_COUNT=0
+STARTED_COUNT=0
+RESULT_KIND="失败"
+RESULT_EXIT_CODE=1
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -52,6 +58,7 @@ Options:
       --temp-dir <path>       Working directory for downloads/extraction
       --log-file <path>       Log file path
       --projects <csv>        Comma-separated project names to verify
+      --start-services        Run 'docker compose up -d' for restored projects with compose files
   -y, --yes                   Skip interactive confirmation
       --dry-run               Show actions without downloading/extracting files
       --no-telegram           Disable Telegram notification even if env vars are set
@@ -61,7 +68,7 @@ Examples:
   bash docker_restore.sh
   bash docker_restore.sh DockerBackup_2026-04-05_160000.tar.gz --yes
   bash docker_restore.sh --remote infini --remote-dir Backup/RN/Docker --dry-run
-  bash docker_restore.sh --config .env --projects NginxProxyManager,openlist,komari
+  bash docker_restore.sh --config .env --projects NginxProxyManager,openlist,komari --start-services
 EOF
 }
 
@@ -94,35 +101,64 @@ log_error() {
   log_raw ERROR "$*"
 }
 
-run_cmd() {
-  if [ "$DRY_RUN" = true ]; then
-    log_info "[dry-run] $*"
-    return 0
-  fi
-  "$@"
+trim_spaces() {
+  local value="$1"
+  value="${value#${value%%[![:space:]]*}}"
+  value="${value%${value##*[![:space:]]}}"
+  printf '%s' "$value"
 }
 
-load_config_file() {
-  local file="$1"
-  if [ ! -f "$file" ]; then
-    log_error "配置文件不存在: $file"
-    exit 1
-  fi
-  # shellcheck disable=SC1090
-  set -a
-  . "$file"
-  set +a
-}
+normalize_remote_dir() {
+  local value
+  value="$(trim_spaces "$1")"
 
-parse_projects_csv() {
-  local csv="$1"
-  PROJECTS=()
-  IFS=',' read -r -a _items <<< "$csv"
-  for item in "${_items[@]}"; do
-    item="${item#${item%%[![:space:]]*}}"
-    item="${item%${item##*[![:space:]]}}"
-    [ -n "$item" ] && PROJECTS+=("$item")
+  while [[ "$value" == /* ]]; do
+    value="${value#/}"
   done
+  while [[ "$value" == */ ]]; do
+    value="${value%/}"
+  done
+  while [[ "$value" == *//* ]]; do
+    value="${value//\/\//\/}"
+  done
+
+  printf '%s' "$value"
+}
+
+join_by() {
+  local delimiter="$1"
+  shift || true
+  local first=true
+  local item
+
+  for item in "$@"; do
+    if [ "$first" = true ]; then
+      printf '%s' "$item"
+      first=false
+    else
+      printf '%s%s' "$delimiter" "$item"
+    fi
+  done
+}
+
+format_count_line() {
+  local label="$1"
+  local count="$2"
+  shift 2 || true
+
+  if [ "$count" -gt 0 ]; then
+    printf '%s（%s）：%s' "$label" "$count" "$(join_by ', ' "$@")"
+  else
+    printf '%s（0）：无' "$label"
+  fi
+}
+
+has_compose_file() {
+  local project_dir="$1"
+  [ -f "${project_dir}/docker-compose.yml" ] || \
+  [ -f "${project_dir}/docker-compose.yaml" ] || \
+  [ -f "${project_dir}/compose.yml" ] || \
+  [ -f "${project_dir}/compose.yaml" ]
 }
 
 send_telegram() {
@@ -139,11 +175,34 @@ send_telegram() {
       log_info "[dry-run] Telegram notification skipped: $message"
       return 0
     fi
+    if ! command -v curl >/dev/null 2>&1; then
+      log_warning "curl not found; skipping Telegram notification"
+      return 0
+    fi
     curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
       -d "text=${full_message}" \
       -d "parse_mode=HTML" >/dev/null 2>&1 || true
   fi
+}
+
+build_telegram_summary() {
+  local emoji="$1"
+  local summary
+  summary="${emoji} <b>Docker restore${RESULT_KIND}</b>%0A"
+  summary+="备份名：<code>${BACKUP_FILE:-unknown}</code>%0A"
+  summary+="恢复目录：<code>${RESTORE_ROOT}</code>%0A"
+  summary+="恢复项目摘要：%0A"
+  summary+="- $(format_count_line "已恢复且可启动" "$STARTABLE_COUNT" "${RESTORED_STARTABLE[@]}")%0A"
+  summary+="- $(format_count_line "已恢复但无 compose" "$RESTORED_NO_COMPOSE_COUNT" "${RESTORED_NO_COMPOSE[@]}")%0A"
+  summary+="- $(format_count_line "未恢复" "$MISSING_COUNT" "${MISSING_PROJECTS[@]}")%0A"
+  summary+="可启动项目数：${STARTABLE_COUNT}%0A"
+  if [ "$START_SERVICES" = true ]; then
+    summary+="自动启动结果：$(format_count_line "已启动" "$STARTED_COUNT" "${STARTED_PROJECTS[@]}")%0A"
+  fi
+  summary+="执行结果：${RESULT_KIND}%0A"
+  summary+="exit code：${RESULT_EXIT_CODE}"
+  printf '%s' "$summary"
 }
 
 cleanup() {
@@ -155,8 +214,10 @@ cleanup() {
 
 error_exit() {
   local exit_code=$?
+  RESULT_KIND="失败"
+  RESULT_EXIT_CODE="$exit_code"
   log_error "Restore job failed (exit=$exit_code)"
-  send_telegram "❌ <b>Docker restore failed</b>%0ACheck log: ${LOG_FILE}"
+  send_telegram "$(build_telegram_summary '❌')"
   cleanup
   exit "$exit_code"
 }
@@ -164,36 +225,85 @@ error_exit() {
 trap error_exit ERR
 trap cleanup EXIT
 
+load_config_file() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    log_error "配置文件不存在: $file"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  set -a
+  . "$file"
+  set +a
+}
+
+parse_projects_csv() {
+  local csv="$1"
+  local item
+  PROJECTS=()
+  IFS=',' read -r -a _items <<< "$csv"
+  for item in "${_items[@]}"; do
+    item="$(trim_spaces "$item")"
+    [ -n "$item" ] && PROJECTS+=("$item")
+  done
+}
+
+detect_config_file() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--config)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+        CONFIG_FILE="$2"
+        return 0
+        ;;
+    esac
+    shift
+  done
+}
+
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -c|--config)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         CONFIG_FILE="$2"
         shift 2
         ;;
       --remote)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         REMOTE_NAME="$2"
         shift 2
         ;;
       --remote-dir)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         REMOTE_DIR="$2"
         shift 2
         ;;
       --restore-root)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         RESTORE_ROOT="$2"
         shift 2
         ;;
       --temp-dir)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         TEMP_DIR="$2"
         shift 2
         ;;
       --log-file)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         LOG_FILE="$2"
         shift 2
         ;;
       --projects)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+        SELECTED_PROJECTS_CSV="$2"
         parse_projects_csv "$2"
+        PROJECTS_SOURCE="user-specified (--projects)"
         shift 2
+        ;;
+      --start-services)
+        START_SERVICES=true
+        shift
         ;;
       -y|--yes)
         YES_MODE=true
@@ -239,8 +349,9 @@ check_dependencies() {
 
   local missing=()
   local optional_missing=()
+  local cmd
 
-  for cmd in rclone tar awk grep sed cut du; do
+  for cmd in rclone tar awk grep sed cut du cp; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
 
@@ -296,7 +407,7 @@ list_backups() {
 }
 
 select_backup() {
-  local selected="${BACKUP_FILE}"
+  local selected="$BACKUP_FILE"
   local results
   results="$(list_backups_raw)"
 
@@ -322,8 +433,10 @@ select_backup() {
 
 download_backup() {
   local local_path="${TEMP_DIR}/$(basename -- "$BACKUP_FILE")"
+  local remote_path="${REMOTE_NAME}:${REMOTE_DIR}/${BACKUP_FILE}"
+
   log_info "Preparing backup download"
-  log_info "Remote: ${REMOTE_NAME}:${REMOTE_DIR}/${BACKUP_FILE}"
+  log_info "Remote: ${remote_path}"
   log_info "Local : ${local_path}"
 
   mkdir -p "$TEMP_DIR"
@@ -333,7 +446,7 @@ download_backup() {
     return 0
   fi
 
-  rclone copy "${REMOTE_NAME}:${REMOTE_DIR}/${BACKUP_FILE}" "$TEMP_DIR" \
+  rclone copy "$remote_path" "$TEMP_DIR" \
     --progress \
     --transfers 4 \
     --buffer-size 64M
@@ -365,6 +478,73 @@ confirm_restore() {
   fi
 }
 
+preview_archive() {
+  local backup_path="$1"
+
+  log_info "Inspecting archive contents"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[dry-run] Would preview archive: $backup_path"
+    return 0
+  fi
+
+  if command -v pigz >/dev/null 2>&1; then
+    tar -I pigz -tf "$backup_path" | awk 'NR<=20 {print} END {if (NR>20) print "..."}'
+  else
+    tar -tzf "$backup_path" | awk 'NR<=20 {print} END {if (NR>20) print "..."}'
+  fi
+}
+
+auto_detect_projects_from_archive() {
+  local backup_path="$1"
+  local relative_root="${RESTORE_ROOT#/}"
+  local listing_cmd=()
+  local detected=()
+  local line
+  local path_after_root
+  local project
+
+  if [ -z "$relative_root" ]; then
+    log_error "restore-root cannot be / for auto project detection"
+    exit 1
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[dry-run] Auto project detection needs archive contents; verification list will be determined during real run"
+    PROJECTS=()
+    PROJECTS_SOURCE="auto-detected from archive during real execution"
+    return 0
+  fi
+
+  if command -v pigz >/dev/null 2>&1; then
+    listing_cmd=(tar -I pigz -tf "$backup_path")
+  else
+    listing_cmd=(tar -tzf "$backup_path")
+  fi
+
+  while IFS= read -r line; do
+    case "$line" in
+      "$relative_root"/*)
+        path_after_root="${line#${relative_root}/}"
+        project="${path_after_root%%/*}"
+        if [ -n "$project" ] && [ "$project" != "$path_after_root" ]; then
+          detected+=("$project")
+        fi
+        ;;
+    esac
+  done < <("${listing_cmd[@]}")
+
+  if [ "${#detected[@]}" -eq 0 ]; then
+    log_warning "No top-level projects auto-detected under ${RESTORE_ROOT} from archive"
+    PROJECTS=()
+    PROJECTS_SOURCE="auto-detected from archive (none found)"
+    return 0
+  fi
+
+  mapfile -t PROJECTS < <(printf '%s\n' "${detected[@]}" | awk '!seen[$0]++')
+  PROJECTS_SOURCE="auto-detected from archive"
+  log_info "Auto-detected projects: ${PROJECTS[*]}"
+}
+
 extract_backup() {
   local backup_path="$1"
   local stage_dir="${TEMP_DIR}/extracted"
@@ -378,12 +558,9 @@ extract_backup() {
 
   source_dir="${stage_dir}/${relative_root}"
 
-  log_info "Inspecting archive contents"
-  if [ "$DRY_RUN" = true ]; then
-    log_info "[dry-run] Would preview archive: $backup_path"
-  else
-    tar -tzf "$backup_path" | head -20
-    echo '...'
+  preview_archive "$backup_path"
+  if [ -z "$SELECTED_PROJECTS_CSV" ]; then
+    auto_detect_projects_from_archive "$backup_path"
   fi
 
   confirm_restore
@@ -421,40 +598,100 @@ verify_restore() {
   echo "Restored projects"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  local success_count=0
-  local total_count="${#PROJECTS[@]}"
-  local project
+  RESTORED_STARTABLE=()
+  RESTORED_NO_COMPOSE=()
+  MISSING_PROJECTS=()
 
-  if [ "$total_count" -eq 0 ]; then
+  local project
+  local project_dir
+  local size
+
+  if [ "${#PROJECTS[@]}" -eq 0 ]; then
     log_warning "No projects configured for verification"
+    STARTABLE_COUNT=0
+    RESTORED_NO_COMPOSE_COUNT=0
+    MISSING_COUNT=0
+    echo "⚠️ 未配置校验项目"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
     return 0
   fi
 
   for project in "${PROJECTS[@]}"; do
-    if [ -d "${RESTORE_ROOT}/${project}" ]; then
-      local size='N/A'
+    project_dir="${RESTORE_ROOT}/${project}"
+    if [ -d "$project_dir" ]; then
+      size='N/A'
       if [ "$DRY_RUN" = false ]; then
-        size="$(du -sh "${RESTORE_ROOT}/${project}" | cut -f1)"
+        size="$(du -sh "$project_dir" | cut -f1)"
       fi
-      printf '✅ %s - %s\n' "$project" "$size"
-      success_count=$((success_count + 1))
+
+      if has_compose_file "$project_dir"; then
+        printf '✅ %s - %s - compose found\n' "$project" "$size"
+        RESTORED_STARTABLE+=("$project")
+      else
+        printf '🟡 %s - %s - no compose\n' "$project" "$size"
+        RESTORED_NO_COMPOSE+=("$project")
+      fi
     else
       printf '❌ %s - not found\n' "$project"
+      MISSING_PROJECTS+=("$project")
     fi
   done
 
+  STARTABLE_COUNT="${#RESTORED_STARTABLE[@]}"
+  RESTORED_NO_COMPOSE_COUNT="${#RESTORED_NO_COMPOSE[@]}"
+  MISSING_COUNT="${#MISSING_PROJECTS[@]}"
+
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  printf 'Restore progress: %s/%s\n' "$success_count" "$total_count"
+  printf '已恢复且可启动: %s\n' "$STARTABLE_COUNT"
+  printf '已恢复但无 compose: %s\n' "$RESTORED_NO_COMPOSE_COUNT"
+  printf '未恢复: %s\n' "$MISSING_COUNT"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo
 
-  if [ "$success_count" -eq "$total_count" ]; then
-    log_success "All configured projects verified"
+  if [ "$MISSING_COUNT" -eq 0 ]; then
+    log_success "Verification completed without missing projects"
     return 0
   fi
 
-  log_warning "Some configured projects were not found"
+  log_warning "Some projects were not restored"
   return 1
+}
+
+start_services() {
+  STARTED_PROJECTS=()
+  STARTED_COUNT=0
+
+  if [ "$START_SERVICES" != true ]; then
+    return 0
+  fi
+
+  if [ "$STARTABLE_COUNT" -eq 0 ]; then
+    log_warning "--start-services specified, but no restored projects with compose files were found"
+    return 0
+  fi
+
+  log_info "Starting restored services for projects with compose files"
+
+  local project
+  local project_dir
+  for project in "${RESTORED_STARTABLE[@]}"; do
+    project_dir="${RESTORE_ROOT}/${project}"
+    if [ "$DRY_RUN" = true ]; then
+      log_info "[dry-run] Would run: cd ${project_dir} && docker compose up -d"
+      STARTED_PROJECTS+=("$project")
+      continue
+    fi
+
+    (
+      cd "$project_dir"
+      docker compose up -d
+    )
+    STARTED_PROJECTS+=("$project")
+    log_success "Started services: ${project}"
+  done
+
+  STARTED_COUNT="${#STARTED_PROJECTS[@]}"
 }
 
 show_next_steps() {
@@ -463,28 +700,59 @@ show_next_steps() {
   echo "Next steps"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo
-  cat <<EOF
+
+  if [ "$START_SERVICES" = true ]; then
+    cat <<EOF
+1. Services were auto-started for restored projects with compose files.
+EOF
+    if [ "$STARTED_COUNT" -gt 0 ]; then
+      local project
+      for project in "${STARTED_PROJECTS[@]}"; do
+        printf '   ✅ %s/%s\n' "$RESTORE_ROOT" "$project"
+      done
+    else
+      echo "   No services were started."
+    fi
+
+    cat <<'EOF'
+2. Check container status:
+   docker ps -a
+
+3. Inspect logs when needed:
+   docker compose logs -f
+EOF
+  else
+    cat <<EOF
 1. Install Docker and Compose if needed:
    curl -fsSL https://get.docker.com | bash
    apt install docker-compose-plugin -y
 
-2. Start restored services:
-$(for project in "${PROJECTS[@]}"; do printf '   cd %s/%s && docker compose up -d\n' "$RESTORE_ROOT" "$project"; done)
+2. Start restored services for projects with compose files:
+EOF
+
+    if [ "$STARTABLE_COUNT" -gt 0 ]; then
+      local project
+      for project in "${RESTORED_STARTABLE[@]}"; do
+        printf '   cd %s/%s && docker compose up -d\n' "$RESTORE_ROOT" "$project"
+      done
+    else
+      echo "   No restored projects with compose files were detected."
+    fi
+
+    cat <<'EOF'
 3. Check container status:
    docker ps -a
 
 4. Inspect logs when needed:
    docker compose logs -f
 EOF
+  fi
+
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 main() {
-  parse_args "$@"
-
-  if [ -z "$CONFIG_FILE" ] && [ -f "${SCRIPT_DIR}/config.example.env" ]; then
-    :
-  fi
+  detect_config_file "$@"
 
   if [ -n "$CONFIG_FILE" ]; then
     load_config_file "$CONFIG_FILE"
@@ -497,12 +765,22 @@ main() {
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
   fi
 
+  parse_args "$@"
+
+  REMOTE_DIR="$(normalize_remote_dir "$REMOTE_DIR")"
+  if [ -z "$REMOTE_DIR" ]; then
+    log_error "remote-dir cannot be empty"
+    exit 1
+  fi
+
   log_info "Starting Docker restore tool"
   log_info "Remote       : ${REMOTE_NAME}:${REMOTE_DIR}"
   log_info "Restore root : ${RESTORE_ROOT}"
   log_info "Temp dir     : ${TEMP_DIR}"
   log_info "Log file     : ${LOG_FILE}"
-  log_info "Projects     : ${PROJECTS[*]:-<none>}"
+  log_info "Projects     : ${PROJECTS[*]:-<auto>}"
+  log_info "Project mode : ${PROJECTS_SOURCE}"
+  log_info "Start svcs   : ${START_SERVICES}"
   [ "$DRY_RUN" = true ] && log_warning "Running in dry-run mode"
 
   check_dependencies
@@ -513,9 +791,18 @@ main() {
   extract_backup "$DOWNLOADED_BACKUP"
 
   if verify_restore; then
-    send_telegram "✅ <b>Docker restore succeeded</b>%0ABackup: ${BACKUP_FILE}%0ALocation: ${RESTORE_ROOT}"
+    RESULT_KIND="成功"
   else
-    send_telegram "⚠️ <b>Docker restore partially succeeded</b>%0ABackup: ${BACKUP_FILE}%0ACheck log: ${LOG_FILE}"
+    RESULT_KIND="部分成功"
+  fi
+
+  start_services
+  RESULT_EXIT_CODE=0
+
+  if [ "$RESULT_KIND" = "成功" ]; then
+    send_telegram "$(build_telegram_summary '✅')"
+  else
+    send_telegram "$(build_telegram_summary '⚠️')"
   fi
 
   show_next_steps

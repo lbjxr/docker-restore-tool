@@ -14,9 +14,10 @@
 - 列出远程备份
 - 自动选最新或手动指定归档
 - 用 `rclone` 下载
+- 安全预览归档内容
 - 先解压到 staging 目录
 - 再复制到目标目录（如 `/opt`）
-- 最后按项目列表做恢复校验
+- 最后按项目列表做恢复校验，并区分是否可直接启动
 
 ---
 
@@ -26,7 +27,9 @@
 - **支持 `--dry-run` 预演**
 - **支持 `--yes` 非交互执行**
 - **支持 `.env.example` 配置文件方式**
-- **支持可选 Telegram 通知**
+- **支持可选 Telegram 通知，回执更完整**
+- **支持 `--start-services` 自动启动可启动项目**
+- **默认从归档自动探测 `RESTORE_ROOT/*` 顶层项目用于校验**
 - **Bash 脚本很小，便于审计和修改**
 
 ---
@@ -78,12 +81,14 @@
 - `sed`
 - `cut`
 - `du`
+- `cp`
 
 ### 推荐但非必需
 
 - `pigz` —— 更快的解压速度
 - `column` —— 让备份列表输出更好看
 - `curl` —— 只有在启用 Telegram 通知时才需要
+- `docker` / `docker compose` —— 只有启用 `--start-services` 时才需要
 
 ### Debian / Ubuntu 安装方式
 
@@ -136,6 +141,12 @@ bash docker_restore.sh --config .env --dry-run
 
 ```bash
 bash docker_restore.sh --config .env --yes
+```
+
+### 6）需要的话，恢复后自动启动服务
+
+```bash
+bash docker_restore.sh --config .env --yes --start-services
 ```
 
 ---
@@ -215,6 +226,12 @@ bash docker_restore.sh --config .env --yes
 
 ```bash
 bash docker_restore.sh DockerBackup_2026-04-05_160000.tar.gz --config .env --yes
+```
+
+### 恢复后自动启动存在 compose 文件的项目
+
+```bash
+bash docker_restore.sh --config .env --yes --start-services
 ```
 
 ### 只预览，不实际改动文件
@@ -297,6 +314,14 @@ bash docker_restore.sh --config .env --restore-root /srv/apps --yes
 bash docker_restore.sh --config .env --projects NginxProxyManager,openlist,komari --yes
 ```
 
+> 如果不传 `--projects`，脚本会默认从归档中自动探测 `RESTORE_ROOT` 下的顶层目录作为校验目标，而不是使用写死列表。
+
+### 恢复后自动启动 compose 项目
+
+```bash
+bash docker_restore.sh --config .env --yes --start-services
+```
+
 ### 禁用 Telegram 通知
 
 ```bash
@@ -311,11 +336,12 @@ bash docker_restore.sh --config .env --yes --no-telegram
 |---|---|
 | `-c, --config <file>` | 从配置文件加载环境变量 |
 | `--remote <name>` | rclone remote 名称 |
-| `--remote-dir <path>` | 远程备份目录 |
+| `--remote-dir <path>` | 远程备份目录；会自动规范化，避免双斜杠 |
 | `--restore-root <path>` | 最终恢复目录根路径 |
 | `--temp-dir <path>` | 临时工作目录 |
 | `--log-file <path>` | 日志文件路径 |
-| `--projects <csv>` | 用逗号分隔的项目列表，用于恢复校验 |
+| `--projects <csv>` | 用逗号分隔的项目列表，用于恢复校验；不传则从归档自动探测 |
+| `--start-services` | 恢复后对存在 compose 文件的项目执行 `docker compose up -d` |
 | `-y, --yes` | 跳过交互确认 |
 | `--dry-run` | 预演，不修改文件 |
 | `--no-telegram` | 禁用 Telegram 通知 |
@@ -327,14 +353,17 @@ bash docker_restore.sh --config .env --yes --no-telegram
 
 1. 检查依赖工具是否存在
 2. 检查 `rclone` remote 是否存在
-3. 列出远程目录中的备份归档
-4. 自动选择最新备份或使用指定文件
-5. 下载到临时目录
-6. 预览归档内容
-7. 解压到 staging 目录
-8. 将 staging 中对应路径复制到最终目录
-9. 校验目标项目目录是否存在
-10. 输出恢复后的后续动作建议
+3. 规范化 `REMOTE_DIR`，避免拼接出双斜杠
+4. 列出远程目录中的备份归档
+5. 自动选择最新备份或使用指定文件
+6. 下载到临时目录
+7. 安全预览归档内容，不会因为预览消耗归档流而影响恢复
+8. 若未传 `--projects`，自动从归档探测 `RESTORE_ROOT` 下的顶层项目目录
+9. 解压到 staging 目录
+10. 将 staging 中对应路径复制到最终目录
+11. 校验结果分为三类：已恢复且可启动、已恢复但无 compose、未恢复
+12. 可选启动可启动项目，并输出恢复后的后续动作建议
+13. 可选发送 Telegram 回执，包含备份名、恢复目录、项目摘要、可启动项目数、结果性质与 exit code
 
 ---
 
@@ -344,15 +373,17 @@ bash docker_restore.sh --config .env --yes --no-telegram
 flowchart TD
     A[开始] --> B[检查依赖]
     B --> C[检查 rclone remote]
-    C --> D[列出远程备份]
-    D --> E[选择最新或指定归档]
-    E --> F[下载到临时目录]
-    F --> G[预览归档内容]
-    G --> H[确认恢复 或 使用 --yes]
-    H --> I[解压到 staging 目录]
-    I --> J[复制到目标恢复目录]
-    J --> K[校验项目目录]
-    K --> L[输出后续步骤 / 可选 Telegram 通知]
+    C --> D[规范化远程目录]
+    D --> E[列出远程备份]
+    E --> F[选择最新或指定归档]
+    F --> G[下载到临时目录]
+    G --> H[安全预览归档内容]
+    H --> I[自动探测项目 或 使用 --projects]
+    I --> J[确认恢复 或 使用 --yes]
+    J --> K[解压到 staging 目录]
+    K --> L[复制到目标恢复目录]
+    L --> M[三级校验项目状态]
+    M --> N[可选启动 compose 项目 / Telegram 通知]
 ```
 
 ---
@@ -413,12 +444,25 @@ tar -tzf your-backup.tar.gz | head -50
 ### 恢复完成但部分项目显示 `not found`
 
 原因：
-- 校验用的项目列表和实际项目名不一致
+- 你通过 `--projects` 指定的项目与实际项目名不一致
+- 自动探测到的项目在最终恢复目录下不存在
 - 备份本身不包含全部预期项目
 
 修复：
-- 用 `--projects` 传入自定义项目列表
-- 或调整默认项目列表/配置
+- 用 `--projects` 传入明确的自定义项目列表
+- 先用 `tar -tzf` 检查归档里 `opt/` 下到底有哪些顶层目录
+- 确认 `--restore-root` 与归档内部路径一致
+
+### 项目显示已恢复但不可启动
+
+原因：
+- 项目目录存在，但没有 `docker-compose.yml` / `docker-compose.yaml` / `compose.yml` / `compose.yaml`
+- compose 文件名或位置不符合脚本默认检查规则
+
+修复：
+- 手动检查项目目录结构
+- 修正 compose 文件位置或名称
+- 若项目本就不依赖 compose，可以忽略该状态
 
 ### 恢复到 `/opt` 时出现 Permission denied
 
@@ -440,6 +484,7 @@ tar -tzf your-backup.tar.gz | head -50
 - 会向目标目录（如 `/opt`）恢复真实文件
 - 可能覆盖现有文件
 - 默认假设归档结构与你的 `--restore-root` 一致
+- `--start-services` 会直接启动恢复后的 compose 项目
 - 启用 Telegram 时会把执行结果发到外部服务
 - 默认信任本机 `rclone` 配置和远端备份内容
 
@@ -455,8 +500,8 @@ tar -tzf your-backup.tar.gz | head -50
 
 ## 当前限制
 
-- 当前校验逻辑只检查目录是否存在
-- 不会验证容器最终是否启动成功
+- 当前校验逻辑只区分目录是否存在、是否含 compose 文件
+- 即使启用了 `--start-services`，也不会进一步验证业务健康状态
 - 还没有 checksum / 签名校验
 - 当前只支持 `tar.gz` 归档
 - 更适合目录恢复，不是数据库逻辑恢复工具
@@ -467,10 +512,9 @@ tar -tzf your-backup.tar.gz | head -50
 
 - 增加 SHA256 校验
 - 支持归档 manifest
-- 从静态项目列表升级为自动发现项目
 - 恢复前先自动备份目标目录
 - 增加结构化日志
-- 增加恢复后健康检查
+- 增加自动启动后的健康检查
 - 支持 `rsync` 复制阶段
 - 接入 `shellcheck` / `shfmt` 做 CI
 

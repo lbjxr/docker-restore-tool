@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 
-# Docker Restore Tool
-# Restore archived Docker project directories from an rclone remote.
+# Docker Backup + Restore Tool
+# Default behavior remains restore-compatible; backup is available via subcommand.
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-REMOTE_NAME="${REMOTE_NAME:-infini}"
-REMOTE_DIR="${REMOTE_DIR:-Backup/RN/Docker}"
+MODE="restore"
+REMOTE_NAME="${REMOTE_NAME:-infinicloud}"
+REMOTE_DIR="${REMOTE_DIR:-Backup/FOSSVPS/Docker}"
 RESTORE_ROOT="${RESTORE_ROOT:-/opt}"
 TEMP_DIR="${TEMP_DIR:-/tmp/docker_restore_work}"
 LOG_FILE="${LOG_FILE:-/tmp/docker_restore.log}"
@@ -22,6 +23,19 @@ START_SERVICES=false
 PROJECTS=()
 PROJECTS_SOURCE="auto-detected from archive"
 SELECTED_PROJECTS_CSV=""
+
+SERVER_NAME="${SERVER_NAME:-$(hostname)}"
+BACKUP_PROJECTS_CSV="${BACKUP_PROJECTS:-NginxProxyManager,Resin,NewsFocus}"
+BACKUP_SOURCE_ROOT="${BACKUP_SOURCE_ROOT:-/opt}"
+BACKUP_REQUIRED_SPACE_KB="${BACKUP_REQUIRED_SPACE_KB:-1048576}"
+BACKUP_RETENTION="${BACKUP_RETENTION:-7d}"
+BACKUP_NAME=""
+UPLOADED_BACKUP_REMOTE=""
+BACKUP_INCLUDED_PROJECTS=()
+BACKUP_MISSING_PROJECTS=()
+BACKUP_INCLUDED_COUNT=0
+BACKUP_MISSING_COUNT=0
+BACKUP_SIZE_HUMAN=""
 
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -45,15 +59,17 @@ NC='\033[0m'
 
 usage() {
   cat <<'EOF'
-Docker Restore Tool
+Docker Backup + Restore Tool
 
 Usage:
   bash docker_restore.sh [backup-file] [options]
+  bash docker_restore.sh restore [backup-file] [options]
+  bash docker_restore.sh backup [options]
 
-Options:
+Restore options:
   -c, --config <file>         Load environment variables from file
-      --remote <name>         rclone remote name (default: infini)
-      --remote-dir <path>     rclone remote directory (default: Backup/RN/Docker)
+      --remote <name>         rclone remote name
+      --remote-dir <path>     rclone remote directory
       --restore-root <path>   Destination root for restored projects (default: /opt)
       --temp-dir <path>       Working directory for downloads/extraction
       --log-file <path>       Log file path
@@ -64,11 +80,26 @@ Options:
       --no-telegram           Disable Telegram notification even if env vars are set
   -h, --help                  Show this help
 
+Backup options:
+  -c, --config <file>         Load environment variables from file
+      --remote <name>         rclone remote name
+      --remote-dir <path>     rclone remote directory
+      --temp-dir <path>       Working directory for packaging/upload
+      --log-file <path>       Log file path
+      --backup-projects <csv> Comma-separated project names to back up
+      --backup-root <path>    Root path containing projects (default: /opt)
+      --retention <age>       Remote retention via rclone delete --min-age (default: 7d)
+      --required-space-kb <n> Minimum free space required in temp filesystem (default: 1048576)
+      --dry-run               Show actions without creating/uploading files
+      --no-telegram           Disable Telegram notification even if env vars are set
+  -h, --help                  Show this help
+
 Examples:
   bash docker_restore.sh
   bash docker_restore.sh DockerBackup_2026-04-05_160000.tar.gz --yes
-  bash docker_restore.sh --remote infini --remote-dir Backup/RN/Docker --dry-run
-  bash docker_restore.sh --config .env --projects NginxProxyManager,openlist,komari --start-services
+  bash docker_restore.sh restore --config .env --dry-run
+  bash docker_restore.sh backup --config .env
+  bash docker_restore.sh backup --backup-projects NginxProxyManager,Resin,NewsFocus
 EOF
 }
 
@@ -162,9 +193,10 @@ has_compose_file() {
 }
 
 send_telegram() {
-  local message="$1"
+  local title="$1"
+  local message="$2"
   local full_message
-  full_message="🖥 <b>$(hostname)</b> - Docker Restore%0A%0A${message}"
+  full_message="🖥 <b>${SERVER_NAME}</b> - ${title}%0A%0A${message}"
 
   if [ "$NO_TELEGRAM" = true ]; then
     return 0
@@ -172,7 +204,7 @@ send_telegram() {
 
   if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
     if [ "$DRY_RUN" = true ]; then
-      log_info "[dry-run] Telegram notification skipped: $message"
+      log_info "[dry-run] Telegram notification skipped: $title"
       return 0
     fi
     if ! command -v curl >/dev/null 2>&1; then
@@ -186,7 +218,7 @@ send_telegram() {
   fi
 }
 
-build_telegram_summary() {
+build_restore_telegram_summary() {
   local emoji="$1"
   local summary
   summary="${emoji} <b>Docker restore${RESULT_KIND}</b>%0A"
@@ -197,9 +229,20 @@ build_telegram_summary() {
   summary+="- $(format_count_line "已恢复但无 compose" "$RESTORED_NO_COMPOSE_COUNT" "${RESTORED_NO_COMPOSE[@]}")%0A"
   summary+="- $(format_count_line "未恢复" "$MISSING_COUNT" "${MISSING_PROJECTS[@]}")%0A"
   summary+="可启动项目数：${STARTABLE_COUNT}%0A"
-  if [ "$START_SERVICES" = true ]; then
-    summary+="自动启动结果：$(format_count_line "已启动" "$STARTED_COUNT" "${STARTED_PROJECTS[@]}")%0A"
-  fi
+  summary+="执行结果：${RESULT_KIND}%0A"
+  summary+="exit code：${RESULT_EXIT_CODE}"
+  printf '%s' "$summary"
+}
+
+build_backup_telegram_summary() {
+  local emoji="$1"
+  local summary
+  summary="${emoji} <b>Docker backup${RESULT_KIND}</b>%0A"
+  summary+="备份名：<code>${BACKUP_NAME:-unknown}</code>%0A"
+  summary+="远端位置：<code>${UPLOADED_BACKUP_REMOTE:-${REMOTE_NAME}:${REMOTE_DIR}}</code>%0A"
+  summary+="打包项目：$(format_count_line "已纳入备份" "$BACKUP_INCLUDED_COUNT" "${BACKUP_INCLUDED_PROJECTS[@]}")%0A"
+  summary+="跳过项目：$(format_count_line "缺失目录" "$BACKUP_MISSING_COUNT" "${BACKUP_MISSING_PROJECTS[@]}")%0A"
+  [ -n "$BACKUP_SIZE_HUMAN" ] && summary+="文件大小：${BACKUP_SIZE_HUMAN}%0A"
   summary+="执行结果：${RESULT_KIND}%0A"
   summary+="exit code：${RESULT_EXIT_CODE}"
   printf '%s' "$summary"
@@ -216,8 +259,12 @@ error_exit() {
   local exit_code=$?
   RESULT_KIND="失败"
   RESULT_EXIT_CODE="$exit_code"
-  log_error "Restore job failed (exit=$exit_code)"
-  send_telegram "$(build_telegram_summary '❌')"
+  log_error "${MODE^} job failed (exit=$exit_code)"
+  if [ "$MODE" = "backup" ]; then
+    send_telegram "Docker Backup" "$(build_backup_telegram_summary '❌')"
+  else
+    send_telegram "Docker Restore" "$(build_restore_telegram_summary '❌')"
+  fi
   cleanup
   exit "$exit_code"
 }
@@ -231,8 +278,8 @@ load_config_file() {
     log_error "配置文件不存在: $file"
     exit 1
   fi
-  # shellcheck disable=SC1090
   set -a
+  # shellcheck disable=SC1090
   . "$file"
   set +a
 }
@@ -248,7 +295,31 @@ parse_projects_csv() {
   done
 }
 
-detect_config_file() {
+parse_backup_projects_csv() {
+  local csv="$1"
+  local item
+  BACKUP_INCLUDED_PROJECTS=()
+  IFS=',' read -r -a _items <<< "$csv"
+  for item in "${_items[@]}"; do
+    item="$(trim_spaces "$item")"
+    [ -n "$item" ] && BACKUP_INCLUDED_PROJECTS+=("$item")
+  done
+}
+
+detect_mode_and_config() {
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      backup|restore)
+        MODE="$1"
+        shift
+        ;;
+      help|-h|--help)
+        usage
+        exit 0
+        ;;
+    esac
+  fi
+
   while [ $# -gt 0 ]; do
     case "$1" in
       -c|--config)
@@ -264,6 +335,10 @@ detect_config_file() {
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
+      backup|restore)
+        MODE="$1"
+        shift
+        ;;
       -c|--config)
         [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         CONFIG_FILE="$2"
@@ -301,6 +376,26 @@ parse_args() {
         PROJECTS_SOURCE="user-specified (--projects)"
         shift 2
         ;;
+      --backup-projects)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+        BACKUP_PROJECTS_CSV="$2"
+        shift 2
+        ;;
+      --backup-root)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+        BACKUP_SOURCE_ROOT="$2"
+        shift 2
+        ;;
+      --retention)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+        BACKUP_RETENTION="$2"
+        shift 2
+        ;;
+      --required-space-kb)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+        BACKUP_REQUIRED_SPACE_KB="$2"
+        shift 2
+        ;;
       --start-services)
         START_SERVICES=true
         shift
@@ -331,7 +426,7 @@ parse_args() {
         exit 1
         ;;
       *)
-        if [ -z "$BACKUP_FILE" ]; then
+        if [ "$MODE" = "restore" ] && [ -z "$BACKUP_FILE" ]; then
           BACKUP_FILE="$1"
         else
           log_error "Unexpected extra argument: $1"
@@ -351,12 +446,17 @@ check_dependencies() {
   local optional_missing=()
   local cmd
 
-  for cmd in rclone tar awk grep sed cut du cp; do
+  for cmd in rclone tar awk grep sed cut du cp df; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
 
   command -v pigz >/dev/null 2>&1 || optional_missing+=("pigz")
   command -v column >/dev/null 2>&1 || optional_missing+=("column")
+  command -v curl >/dev/null 2>&1 || optional_missing+=("curl")
+
+  if [ "$MODE" = "backup" ]; then
+    command -v mkdir >/dev/null 2>&1 || missing+=("mkdir")
+  fi
 
   if [ "${#missing[@]}" -gt 0 ]; then
     log_error "Missing required tools: ${missing[*]}"
@@ -463,6 +563,11 @@ download_backup() {
 }
 
 confirm_restore() {
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[dry-run] Confirmation skipped"
+    return 0
+  fi
+
   if [ "$YES_MODE" = true ]; then
     log_info "Confirmation skipped (--yes)"
     return 0
@@ -694,35 +799,134 @@ start_services() {
   STARTED_COUNT="${#STARTED_PROJECTS[@]}"
 }
 
+check_backup_disk_space() {
+  log_info "Checking temp filesystem free space"
+  local available_space
+  available_space="$(df "$TEMP_DIR" 2>/dev/null | tail -1 | awk '{print $4}')"
+  if [ -z "$available_space" ]; then
+    available_space="$(df /tmp | tail -1 | awk '{print $4}')"
+  fi
+
+  if [ "$available_space" -lt "$BACKUP_REQUIRED_SPACE_KB" ]; then
+    local available_gb required_gb
+    available_gb="$(awk "BEGIN {printf \"%.2f\", $available_space/1024/1024}")"
+    required_gb="$(awk "BEGIN {printf \"%.2f\", $BACKUP_REQUIRED_SPACE_KB/1024/1024}")"
+    log_error "Insufficient disk space. Available: ${available_gb}GB, required: ${required_gb}GB"
+    exit 1
+  fi
+  log_success "Disk space check passed"
+}
+
+build_backup_project_paths() {
+  parse_backup_projects_csv "$BACKUP_PROJECTS_CSV"
+  local requested=("${BACKUP_INCLUDED_PROJECTS[@]}")
+  BACKUP_INCLUDED_PROJECTS=()
+  BACKUP_MISSING_PROJECTS=()
+
+  local project project_dir
+  for project in "${requested[@]}"; do
+    project_dir="${BACKUP_SOURCE_ROOT%/}/${project}"
+    if [ -d "$project_dir" ]; then
+      BACKUP_INCLUDED_PROJECTS+=("$project")
+      log_info "Include backup project: $project_dir"
+    else
+      BACKUP_MISSING_PROJECTS+=("$project")
+      log_warning "Skip missing project directory: $project_dir"
+    fi
+  done
+
+  BACKUP_INCLUDED_COUNT="${#BACKUP_INCLUDED_PROJECTS[@]}"
+  BACKUP_MISSING_COUNT="${#BACKUP_MISSING_PROJECTS[@]}"
+
+  if [ "$BACKUP_INCLUDED_COUNT" -eq 0 ]; then
+    log_error "No valid backup project directories found"
+    exit 1
+  fi
+}
+
+create_backup_archive() {
+  mkdir -p "$TEMP_DIR"
+  check_backup_disk_space
+  build_backup_project_paths
+
+  BACKUP_NAME="DockerBackup_$(date +'%Y-%m-%d_%H%M%S').tar.gz"
+  local archive_path="${TEMP_DIR}/${BACKUP_NAME}"
+  local absolute_paths=()
+  local project
+
+  for project in "${BACKUP_INCLUDED_PROJECTS[@]}"; do
+    absolute_paths+=("${BACKUP_SOURCE_ROOT%/}/${project}")
+  done
+
+  log_info "Preparing backup archive: ${archive_path}"
+
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[dry-run] Would archive: $(join_by ', ' "${absolute_paths[@]}")"
+    BACKUP_SIZE_HUMAN="unknown (dry-run)"
+    return 0
+  fi
+
+  if command -v pigz >/dev/null 2>&1; then
+    log_info "Using pigz for compression"
+    tar -I pigz -cf "$archive_path" "${absolute_paths[@]}" 2>>"$LOG_FILE"
+  else
+    log_warning "pigz not found; falling back to gzip"
+    tar -czf "$archive_path" "${absolute_paths[@]}" 2>>"$LOG_FILE"
+  fi
+
+  if [ ! -f "$archive_path" ]; then
+    log_error "Backup archive not created: $archive_path"
+    exit 1
+  fi
+
+  if tar -tzf "$archive_path" >/dev/null 2>&1; then
+    log_success "Archive integrity check passed"
+  else
+    log_error "Archive integrity check failed"
+    exit 1
+  fi
+
+  BACKUP_SIZE_HUMAN="$(du -h "$archive_path" | cut -f1)"
+  log_success "Backup archive ready: ${BACKUP_SIZE_HUMAN}"
+}
+
+upload_backup_archive() {
+  local archive_path="${TEMP_DIR}/${BACKUP_NAME}"
+  UPLOADED_BACKUP_REMOTE="${REMOTE_NAME}:${REMOTE_DIR}/${BACKUP_NAME}"
+
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[dry-run] Would upload ${archive_path} -> ${UPLOADED_BACKUP_REMOTE}"
+    return 0
+  fi
+
+  log_info "Uploading backup to ${UPLOADED_BACKUP_REMOTE}"
+  rclone copy "$archive_path" "${REMOTE_NAME}:${REMOTE_DIR}" \
+    --progress \
+    --transfers 8 \
+    --checkers 8 \
+    --buffer-size 128M
+
+  log_success "Upload completed"
+}
+
+cleanup_old_backups() {
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[dry-run] Would delete remote backups older than ${BACKUP_RETENTION} under ${REMOTE_NAME}:${REMOTE_DIR}"
+    return 0
+  fi
+
+  log_info "Cleaning remote backups older than ${BACKUP_RETENTION}"
+  rclone delete "${REMOTE_NAME}:${REMOTE_DIR}" --min-age "$BACKUP_RETENTION"
+  log_success "Remote retention cleanup completed"
+}
+
 show_next_steps() {
   echo
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "Next steps"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo
-
-  if [ "$START_SERVICES" = true ]; then
-    cat <<EOF
-1. Services were auto-started for restored projects with compose files.
-EOF
-    if [ "$STARTED_COUNT" -gt 0 ]; then
-      local project
-      for project in "${STARTED_PROJECTS[@]}"; do
-        printf '   ✅ %s/%s\n' "$RESTORE_ROOT" "$project"
-      done
-    else
-      echo "   No services were started."
-    fi
-
-    cat <<'EOF'
-2. Check container status:
-   docker ps -a
-
-3. Inspect logs when needed:
-   docker compose logs -f
-EOF
-  else
-    cat <<EOF
+  cat <<EOF
 1. Install Docker and Compose if needed:
    curl -fsSL https://get.docker.com | bash
    apt install docker-compose-plugin -y
@@ -730,49 +934,26 @@ EOF
 2. Start restored services for projects with compose files:
 EOF
 
-    if [ "$STARTABLE_COUNT" -gt 0 ]; then
-      local project
-      for project in "${RESTORED_STARTABLE[@]}"; do
-        printf '   cd %s/%s && docker compose up -d\n' "$RESTORE_ROOT" "$project"
-      done
-    else
-      echo "   No restored projects with compose files were detected."
-    fi
+  if [ "$STARTABLE_COUNT" -gt 0 ]; then
+    local project
+    for project in "${RESTORED_STARTABLE[@]}"; do
+      printf '   cd %s/%s && docker compose up -d\n' "$RESTORE_ROOT" "$project"
+    done
+  else
+    echo "   No restored projects with compose files were detected."
+  fi
 
-    cat <<'EOF'
+  cat <<'EOF'
 3. Check container status:
    docker ps -a
 
 4. Inspect logs when needed:
    docker compose logs -f
 EOF
-  fi
-
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
-main() {
-  detect_config_file "$@"
-
-  if [ -n "$CONFIG_FILE" ]; then
-    load_config_file "$CONFIG_FILE"
-    REMOTE_NAME="${REMOTE_NAME:-infini}"
-    REMOTE_DIR="${REMOTE_DIR:-Backup/RN/Docker}"
-    RESTORE_ROOT="${RESTORE_ROOT:-/opt}"
-    TEMP_DIR="${TEMP_DIR:-/tmp/docker_restore_work}"
-    LOG_FILE="${LOG_FILE:-/tmp/docker_restore.log}"
-    TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-    TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-  fi
-
-  parse_args "$@"
-
-  REMOTE_DIR="$(normalize_remote_dir "$REMOTE_DIR")"
-  if [ -z "$REMOTE_DIR" ]; then
-    log_error "remote-dir cannot be empty"
-    exit 1
-  fi
-
+run_restore() {
   log_info "Starting Docker restore tool"
   log_info "Remote       : ${REMOTE_NAME}:${REMOTE_DIR}"
   log_info "Restore root : ${RESTORE_ROOT}"
@@ -800,13 +981,64 @@ main() {
   RESULT_EXIT_CODE=0
 
   if [ "$RESULT_KIND" = "成功" ]; then
-    send_telegram "$(build_telegram_summary '✅')"
+    send_telegram "Docker Restore" "$(build_restore_telegram_summary '✅')"
   else
-    send_telegram "$(build_telegram_summary '⚠️')"
+    send_telegram "Docker Restore" "$(build_restore_telegram_summary '⚠️')"
   fi
 
   show_next_steps
   log_success "Restore job completed"
+}
+
+run_backup() {
+  log_info "Starting Docker backup tool"
+  log_info "Remote        : ${REMOTE_NAME}:${REMOTE_DIR}"
+  log_info "Backup root   : ${BACKUP_SOURCE_ROOT}"
+  log_info "Backup prjs   : ${BACKUP_PROJECTS_CSV}"
+  log_info "Retention     : ${BACKUP_RETENTION}"
+  log_info "Temp dir      : ${TEMP_DIR}"
+  log_info "Log file      : ${LOG_FILE}"
+  [ "$DRY_RUN" = true ] && log_warning "Running in dry-run mode"
+
+  check_dependencies
+  check_rclone_config
+  create_backup_archive
+  upload_backup_archive
+  cleanup_old_backups
+
+  RESULT_KIND="成功"
+  RESULT_EXIT_CODE=0
+  send_telegram "Docker Backup" "$(build_backup_telegram_summary '✅')"
+  log_success "Backup job completed"
+}
+
+main() {
+  detect_mode_and_config "$@"
+
+  if [ -n "$CONFIG_FILE" ]; then
+    load_config_file "$CONFIG_FILE"
+  fi
+
+  parse_args "$@"
+
+  REMOTE_DIR="$(normalize_remote_dir "$REMOTE_DIR")"
+  if [ -z "$REMOTE_DIR" ]; then
+    log_error "remote-dir cannot be empty"
+    exit 1
+  fi
+
+  case "$MODE" in
+    backup)
+      run_backup
+      ;;
+    restore)
+      run_restore
+      ;;
+    *)
+      log_error "Unsupported mode: $MODE"
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"

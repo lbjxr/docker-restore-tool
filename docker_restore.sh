@@ -36,6 +36,13 @@ BACKUP_MISSING_PROJECTS=()
 BACKUP_INCLUDED_COUNT=0
 BACKUP_MISSING_COUNT=0
 BACKUP_SIZE_HUMAN=""
+BACKUP_EXCLUDES_DEFAULT=(
+  "*/Resin/data/log/*"
+  "*/Resin/data/cache/*"
+  "*/NginxProxyManager/data/logs/*"
+  "*/NewsFocus/vps-deploy/cache/*"
+  "*/.git/*"
+)
 
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -866,12 +873,18 @@ create_backup_archive() {
     return 0
   fi
 
+  local exclude_args=()
+  local pattern
+  for pattern in "${BACKUP_EXCLUDES_DEFAULT[@]}"; do
+    exclude_args+=("--exclude=$pattern")
+  done
+
   if command -v pigz >/dev/null 2>&1; then
     log_info "Using pigz for compression"
-    tar -I pigz -cf "$archive_path" "${absolute_paths[@]}" 2>>"$LOG_FILE"
+    tar -I pigz -cf "$archive_path" "${exclude_args[@]}" "${absolute_paths[@]}" 2>>"$LOG_FILE"
   else
     log_warning "pigz not found; falling back to gzip"
-    tar -czf "$archive_path" "${absolute_paths[@]}" 2>>"$LOG_FILE"
+    tar -czf "$archive_path" "${exclude_args[@]}" "${absolute_paths[@]}" 2>>"$LOG_FILE"
   fi
 
   if [ ! -f "$archive_path" ]; then

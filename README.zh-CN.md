@@ -98,6 +98,7 @@ bash docker_restore.sh backup --config .env
 bash docker_restore.sh backup --config .env --dry-run
 bash docker_restore.sh backup --backup-projects NginxProxyManager,Resin,NewsFocus
 bash docker_restore.sh backup --retention 7d
+bash docker_restore.sh backup --backup-excludes "*/node_modules/*,*/tmp/*"
 ```
 
 ---
@@ -125,6 +126,7 @@ bash docker_restore.sh backup --retention 7d
 
 - `--backup-projects <csv>` —— 要打包的项目列表
 - `--backup-root <path>` —— 这些项目所在根目录
+- `--backup-excludes <csv>` —— 追加 tar 排除模式，在内建默认排除规则之后生效
 - `--retention <age>` —— 远端清理阈值，对应 `rclone delete --min-age`
 - `--required-space-kb <n>` —— 打包前要求的最小剩余空间
 
@@ -157,6 +159,8 @@ TELEGRAM_CHAT_ID=
 - 脚本正文里不再硬编码 Telegram 密钥。
 - `pigz` 现在只是可选依赖；没有的话自动回退到普通 gzip 流程。
 - 备份时只会纳入实际存在的目录。
+- 如果是机器级长期配置，建议在 `.env` 里同时写 `BACKUP_PROJECTS` 和 `BACKUP_PROJECTS_CSV`，避免配置加载后实际项目列表不明确。
+- 如果你必须保留少量关键单文件，建议先把这些文件复制到一个小目录里，例如 `/opt/docker-restore-tool/extra-core/`，再把这个目录纳入备份项目；不要直接依赖单文件路径混进项目列表。
 
 ---
 
@@ -203,6 +207,16 @@ TELEGRAM_CHAT_ID=
 - 不要把真实 `.env` 秘钥提交进仓库。
 
 ---
+
+## 示例：精简 OpenClaw 核心备份
+
+如果某台机器上的 OpenClaw 运行时目录很大，不要无脑把整个运行目录打包进去。更稳的做法是：
+
+- 只纳入小而关键的目录，例如 `identity`、`devices`、`config.d`、`credentials`、`cron`、`workspace/docs`、`workspace/scripts`、`workspace/memory`、`workspace/tasks`
+- 明确排除 `media`、`reports`、`embeddings`、`vendor`、`tmp`、`logs`、cached agent workspace 这类运行态噪音目录
+- 对必须保留的关键单文件（例如 `AGENTS.md`、`SOUL.md`、`USER.md`、`TOOLS.md`、`MEMORY.md`、`HEARTBEAT.md`、`IDENTITY.md`、`openclaw.json`），先复制到 `/opt/docker-restore-tool/extra-core/` 这样的辅助目录，再把这个目录一起备份
+
+这样更接近“可恢复的核心上下文”，不会把大量运行时噪音也打进归档。
 
 ## 推荐 cron 写法
 

@@ -95,6 +95,7 @@ bash docker_restore.sh backup --config .env
 bash docker_restore.sh backup --config .env --dry-run
 bash docker_restore.sh backup --backup-projects NginxProxyManager,Resin,NewsFocus
 bash docker_restore.sh backup --retention 7d
+bash docker_restore.sh backup --backup-excludes "*/node_modules/*,*/tmp/*"
 ```
 
 ---
@@ -122,6 +123,7 @@ bash docker_restore.sh backup --retention 7d
 
 - `--backup-projects <csv>` — project list to package
 - `--backup-root <path>` — source root containing those projects
+- `--backup-excludes <csv>` — extra tar exclude patterns appended to built-in defaults
 - `--retention <age>` — remote cleanup threshold for `rclone delete --min-age`
 - `--required-space-kb <n>` — minimum free space required before packaging
 
@@ -154,6 +156,8 @@ TELEGRAM_CHAT_ID=
 - The tool no longer depends on hardcoded Telegram secrets in the script body.
 - `pigz` is optional. If missing, the tool falls back to normal `gzip` behavior.
 - Backup only includes directories that actually exist.
+- For machine-specific backups, prefer setting both `BACKUP_PROJECTS` and `BACKUP_PROJECTS_CSV` in `.env` so the effective project list is explicit after config load.
+- If you must preserve a handful of important standalone files, gather copied file contents into a small directory such as `/opt/docker-restore-tool/extra-core/` and include that directory in backup projects.
 
 ---
 
@@ -201,6 +205,16 @@ TELEGRAM_CHAT_ID=
 - Do not commit real `.env` secrets.
 
 ---
+
+## Example: compact OpenClaw core backup
+
+If a host contains a large OpenClaw runtime tree, avoid backing up the entire runtime directory blindly. A safer pattern is:
+
+- include only small core directories such as `identity`, `devices`, `config.d`, `credentials`, `cron`, `workspace/docs`, `workspace/scripts`, `workspace/memory`, `workspace/tasks`
+- exclude runtime-heavy directories such as media, reports, embeddings, vendor, tmp, logs, and cached agent workspaces
+- copy must-keep standalone files (for example `AGENTS.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `MEMORY.md`, `HEARTBEAT.md`, `IDENTITY.md`, `openclaw.json`) into a small helper directory like `/opt/docker-restore-tool/extra-core/`, then back up that directory
+
+This keeps archives focused on restorable operator context instead of noisy runtime data.
 
 ## Suggested Cron Example
 

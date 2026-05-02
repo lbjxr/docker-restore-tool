@@ -43,6 +43,7 @@ BACKUP_EXCLUDES_DEFAULT=(
   "*/NewsFocus/vps-deploy/cache/*"
   "*/.git/*"
 )
+BACKUP_EXCLUDES_CSV="${BACKUP_EXCLUDES:-}"
 
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -97,6 +98,7 @@ Backup options:
       --backup-root <path>    Root path containing projects (default: /opt)
       --retention <age>       Remote retention via rclone delete --min-age (default: 7d)
       --required-space-kb <n> Minimum free space required in temp filesystem (default: 1048576)
+      --backup-excludes <csv> Extra tar exclude patterns appended to the built-in defaults
       --dry-run               Show actions without creating/uploading files
       --no-telegram           Disable Telegram notification even if env vars are set
   -h, --help                  Show this help
@@ -107,6 +109,7 @@ Examples:
   bash docker_restore.sh restore --config .env --dry-run
   bash docker_restore.sh backup --config .env
   bash docker_restore.sh backup --backup-projects NginxProxyManager,Resin,NewsFocus
+  bash docker_restore.sh backup --backup-excludes "*/node_modules/*,*/tmp/*"
 EOF
 }
 
@@ -313,6 +316,18 @@ parse_backup_projects_csv() {
   done
 }
 
+parse_backup_excludes_csv() {
+  local csv="$1"
+  local item
+  local parsed=()
+  IFS=',' read -r -a _items <<< "$csv"
+  for item in "${_items[@]}"; do
+    item="$(trim_spaces "$item")"
+    [ -n "$item" ] && parsed+=("$item")
+  done
+  printf '%s\n' "${parsed[@]}"
+}
+
 detect_mode_and_config() {
   if [ $# -gt 0 ]; then
     case "$1" in
@@ -401,6 +416,11 @@ parse_args() {
       --required-space-kb)
         [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
         BACKUP_REQUIRED_SPACE_KB="$2"
+        shift 2
+        ;;
+      --backup-excludes)
+        [ $# -ge 2 ] || { log_error "Missing value for $1"; exit 1; }
+        BACKUP_EXCLUDES_CSV="$2"
         shift 2
         ;;
       --start-services)
@@ -878,6 +898,11 @@ create_backup_archive() {
   for pattern in "${BACKUP_EXCLUDES_DEFAULT[@]}"; do
     exclude_args+=("--exclude=$pattern")
   done
+  if [ -n "$BACKUP_EXCLUDES_CSV" ]; then
+    while IFS= read -r pattern; do
+      [ -n "$pattern" ] && exclude_args+=("--exclude=$pattern")
+    done < <(parse_backup_excludes_csv "$BACKUP_EXCLUDES_CSV")
+  fi
 
   if command -v pigz >/dev/null 2>&1; then
     log_info "Using pigz for compression"
